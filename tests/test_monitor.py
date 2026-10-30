@@ -1,9 +1,11 @@
 """Pruebas sin acceso a los servicios ni a los datos reales del equipo."""
 from concurrent.futures import Future
 import contextlib
+import datetime
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +28,8 @@ def sample_data():
         'uptime': '1 h 0 min',
         'kernel': 'test-kernel',
         'architecture': 'test-arch',
+        'collected_at': datetime.datetime(2026, 10, 29, 14, 32, 5,
+                                          tzinfo=datetime.timezone.utc),
     }
 
 
@@ -165,6 +169,11 @@ class SnapshotTests(unittest.TestCase):
         for key in names.values():
             self.assertEqual(result[key], data[key])
         self.assertEqual(result['logical'], 2)
+        self.assertIsNotNone(result['collected_at'].tzinfo)
+
+    def test_timestamp_is_shown_in_text_output(self):
+        text = '\n'.join(line for line, _ in monitor.format_snapshot(sample_data()))
+        self.assertIn('Última actualización: 29/10/2026 14:32:05 +0000', text)
 
     @patch('src.monitor.collect_data')
     def test_snapshot_connects_collection_and_formatting(self, collect):
@@ -173,7 +182,117 @@ class SnapshotTests(unittest.TestCase):
                          monitor.format_snapshot(sample_data(), True))
 
 
+class SummaryTests(unittest.TestCase):
+    def test_healthy_metrics(self):
+        data = sample_data()
+        data['disk'] = SimpleNamespace(used=20, total=100)
+        self.assertIn(('Sin alertas en las métricas comprobadas', 1),
+                      monitor.summary_lines(data))
+
+    def test_percentage_thresholds(self):
+        for percent, color in [(74, None), (75, 3), (89, 3), (90, 4), (100, 4)]:
+            with self.subTest(percent=percent):
+                data = sample_data()
+                data.update(cpu=(percent, {}), memory=(percent, 100),
+                            disk=SimpleNamespace(used=percent, total=100))
+                lines = monitor.summary_lines(data)
+                for label in ('CPU', 'RAM', 'Disco /'):
+                    matches = [(text, shade) for text, shade in lines
+                               if f'{label} al ' in text]
+                    if color is None:
+                        self.assertEqual(matches, [])
+                    else:
+                        self.assertEqual(len(matches), 1)
+                        self.assertEqual(matches[0][1], color)
+
+    def test_battery_thresholds_and_unknown_capacity(self):
+        data = sample_data()
+        data['batteries'] = [('BAT0', 10, 'Descargando'), ('BAT1', 20, 'Cargando'),
+                             ('BAT2', 21, 'Descargando'), ('BAT3', None, 'Desconocido')]
+        lines = monitor.summary_lines(data)
+        self.assertIn(('CRÍTICO: BAT0 al 10 % (Descargando)', 4), lines)
+        self.assertIn(('AVISO: BAT1 al 20 % (Cargando)', 3), lines)
+        self.assertIn(('AVISO: porcentaje de BAT3 no disponible', 3), lines)
+        self.assertFalse(any('BAT2' in text for text, _ in lines))
+
+    def test_missing_metrics_and_failed_commands_are_not_healthy(self):
+        data = sample_data()
+        data.update(cpu=(None, {}), memory=(0, 0), disk=None,
+                    networks=([], 'Error de red'), containers=([], 'Docker ausente'))
+        lines = monitor.summary_lines(data)
+        text = '\n'.join(line for line, _ in lines)
+        for label in ('CPU', 'RAM', 'Disco /'):
+            self.assertIn(f'{label} no disponible', text)
+        self.assertIn('Error de red', text)
+        self.assertIn('Docker ausente', text)
+        self.assertNotIn('Sin alertas', text)
+
+
 class ScreenTests(unittest.TestCase):
+    def run_frames(self, futures, keys):
+        window = MagicMock()
+        window.getmaxyx.return_value = (80, 120)
+        window.getch.side_effect = keys
+        frames = []
+        current = []
+        window.erase.side_effect = current.clear
+        window.addnstr.side_effect = lambda y, x, text, width, attr: current.append(text)
+        window.refresh.side_effect = lambda: frames.append(list(current))
+        executor = MagicMock()
+        executor.submit.side_effect = futures
+        with patch.object(monitor.curses, 'curs_set'), \
+                patch.object(monitor.curses, 'has_colors', return_value=False), \
+                patch.object(monitor.time, 'monotonic', return_value=0):
+            monitor.run_screen(window, 2, executor)
+        return frames
+
+    def test_initial_pending_indicator(self):
+        frames = self.run_frames([Future()], [ord('q')])
+        self.assertIn('Consultando primera muestra…', frames[0])
+
+    def test_refresh_keeps_previous_timestamp_while_pending(self):
+        complete = Future()
+        complete.set_result(sample_data())
+        frames = self.run_frames([complete, Future()], [-1, ord('r'), ord('q')])
+        self.assertIn('Actualizado: 14:32:05', frames[1])
+        self.assertIn('Actualizando…', frames[2])
+        self.assertIn('Última actualización: 29/10/2026 14:32:05 +0000', frames[2])
+
+    def test_failure_keeps_previous_data_and_recovers(self):
+        first, failed, recovered = Future(), Future(), Future()
+        first.set_result(sample_data())
+        failed.set_exception(RuntimeError('Consulta fallida'))
+        new_data = sample_data()
+        new_data['collected_at'] += datetime.timedelta(seconds=10)
+        recovered.set_result(new_data)
+        frames = self.run_frames([first, failed, recovered],
+                                 [-1, ord('r'), -1, ord('r'), -1, ord('q')])
+        self.assertIn('ERROR: datos anteriores', frames[3])
+        self.assertIn('RuntimeError: Consulta fallida', frames[3])
+        self.assertIn('CPU          25%', frames[3])
+        self.assertIn('Última actualización: 29/10/2026 14:32:05 +0000', frames[3])
+        self.assertIn('Actualizado: 14:32:15', frames[-1])
+        self.assertNotIn('ERROR: datos anteriores', frames[-1])
+
+    def test_first_failure_retries_automatically(self):
+        failed, recovered = Future(), Future()
+        failed.set_exception(RuntimeError('Consulta fallida'))
+        recovered.set_result(sample_data())
+        window = MagicMock()
+        window.getmaxyx.return_value = (80, 120)
+        window.getch.side_effect = [-1, -1, -1, ord('q')]
+        executor = MagicMock()
+        executor.submit.side_effect = [failed, recovered]
+        # 1: enviar; 2: fallo y programar; 3: vence la espera; 4: recuperar.
+        with patch.object(monitor.curses, 'curs_set'), \
+                patch.object(monitor.curses, 'has_colors', return_value=False), \
+                patch.object(monitor.time, 'monotonic', side_effect=[0, 0, 0, 2, 2, 2]):
+            monitor.run_screen(window, 2, executor)
+        rendered = [call.args[2] for call in window.addnstr.call_args_list]
+        self.assertIn('ERROR: sin datos', rendered)
+        self.assertIn('Actualizado: 14:32:05', rendered)
+        self.assertEqual(executor.submit.call_count, 2)
+
     @patch('src.monitor.curses.curs_set')
     @patch('src.monitor.curses.has_colors', return_value=False)
     def test_keyboard_works_while_collection_is_pending(self, *_):

@@ -245,7 +245,41 @@ def collect_data():
     data['logical'] = len(data['cpu'][1]) or os.cpu_count()
     data['kernel'] = platform.release()
     data['architecture'] = platform.machine()
+    data['collected_at'] = datetime.datetime.now().astimezone()
     return data
+
+
+def summary_lines(data):
+    """Resume umbrales y datos ausentes sin afirmar que todo el equipo está sano."""
+    alerts = []
+    cpu, _ = data['cpu']
+    memory = data['memory']
+    disk = data['disk']
+    percentages = [
+        ('CPU', cpu),
+        ('RAM', 100 * memory[0] / memory[1] if memory and memory[1] > 0 else None),
+        ('Disco /', 100 * disk.used / disk.total if disk and disk.total > 0 else None),
+    ]
+    for label, percent in percentages:
+        if percent is None:
+            alerts.append((f'AVISO: {label} no disponible', 3))
+        elif percent >= 75:
+            severity = 'CRÍTICO' if percent >= 90 else 'AVISO'
+            alerts.append((f'{severity}: {label} al {percent:.1f} %', percent_color(percent)))
+    for name, percent, status in data['batteries']:
+        if percent is None:
+            alerts.append((f'AVISO: porcentaje de {name} no disponible', 3))
+        elif percent <= 20:
+            severity = 'CRÍTICO' if percent <= 10 else 'AVISO'
+            alerts.append((f'{severity}: {name} al {percent} % ({status})',
+                           4 if percent <= 10 else 3))
+    for label, key in [('Red', 'networks'), ('Docker', 'containers')]:
+        error = data[key][1]
+        if error:
+            alerts.append((f'AVISO: {label}: {error}', 3))
+    if not alerts:
+        alerts.append(('Sin alertas en las métricas comprobadas', 1))
+    return [('RESUMEN', 2)] + alerts
 
 
 def format_snapshot(data, details=False):
@@ -259,7 +293,10 @@ def format_snapshot(data, details=False):
     if main_network is None:
         main_network = next((row for row in networks if row[3] == 'UP'
                              and row[0].startswith(('wl', 'en', 'eth', 'ww'))), None)
-    lines = [('SISTEMA', 2), (f"SO           {data['os']}", 0)]
+    lines = [(f"Última actualización: {data['collected_at']:%d/%m/%Y %H:%M:%S %z}", 0),
+             ('', 0)]
+    lines.extend(summary_lines(data))
+    lines.extend([('', 0), ('SISTEMA', 2), (f"SO           {data['os']}", 0)])
     cpu, core_usage = data['cpu']
     lines.append((f'CPU          {cpu}%' if cpu is not None else 'CPU          No disponible',
                   percent_color(cpu) if cpu is not None else 0))
@@ -366,13 +403,23 @@ def run_screen(stdscr, interval, executor):
     lines = [('Recogiendo información…', 0)]
     data = None
     pending = None
+    refresh_error = None
     details = False
     scroll = 0
     while True:
         if pending is not None and pending.done():
-            data = pending.result()
+            try:
+                new_data = pending.result()
+                new_lines = format_snapshot(new_data, details)
+            except Exception as exc:
+                # Frontera del trabajo en segundo plano: conservar la última muestra.
+                refresh_error = ''.join(char if char.isprintable() else ' '
+                                        for char in f'{type(exc).__name__}: {exc}')
+            else:
+                data = new_data
+                lines = new_lines
+                refresh_error = None
             pending = None
-            lines = format_snapshot(data, details)
             next_refresh = time.monotonic() + interval
         if pending is None and time.monotonic() >= next_refresh:
             pending = executor.submit(collect_data)
@@ -394,13 +441,25 @@ def run_screen(stdscr, interval, executor):
         put(1, 'ESTADO DEL EQUIPO', 2, True)
         put(2, f'{socket.gethostname()} · {datetime.datetime.now():%d/%m/%Y %H:%M:%S}')
         put(3, '─' * max(0, width - 4), 2)
+        if refresh_error:
+            put(4, 'ERROR: datos anteriores' if data is not None else 'ERROR: sin datos', 4)
+        elif pending is not None:
+            put(4, 'Actualizando…' if data is not None else 'Consultando primera muestra…', 3)
+        else:
+            put(4, f"Actualizado: {data['collected_at']:%H:%M:%S}", 1)
         put(height - 3, '─' * max(0, width - 4), 2)
+        display_lines = lines
+        if refresh_error:
+            message = ('Se conserva la muestra anterior.' if data is not None
+                       else 'Todavía no hay una muestra válida.')
+            display_lines = [('ERROR DE ACTUALIZACIÓN', 4), (refresh_error, 3),
+                             (message + ' Se reintentará automáticamente.', 3), ('', 0)] + lines
         visible = max(0, height - 8)
-        scroll = min(scroll, max(0, len(lines) - visible)) if visible else 0
+        scroll = min(scroll, max(0, len(display_lines) - visible)) if visible else 0
         if height < 12 or width < 36:
             put(5, 'Ampliá la terminal para ver el panel.', 3)
         else:
-            for y, (value, color) in enumerate(lines[scroll:scroll + visible], 5):
+            for y, (value, color) in enumerate(display_lines[scroll:scroll + visible], 5):
                 put(y, value, color, color == 2)
         put(height - 2, f'q salir · r actualizar · d detalles · ↑↓ mover · {interval:g}s', 2)
         stdscr.refresh()
@@ -413,7 +472,7 @@ def run_screen(stdscr, interval, executor):
             if data is not None:
                 lines = format_snapshot(data, details)
         if key in (curses.KEY_DOWN, ord('j')):
-            scroll = min(scroll + 1, max(0, len(lines) - visible))
+            scroll = min(scroll + 1, max(0, len(display_lines) - visible))
         if key in (curses.KEY_UP, ord('k')):
             scroll = max(0, scroll - 1)
         if key in (ord('r'), ord('R'), curses.KEY_RESIZE):

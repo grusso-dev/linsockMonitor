@@ -6,6 +6,8 @@ en una pantalla de terminal que se actualiza automáticamente, o como texto en u
 
 ## Qué muestra
 
+- Fecha y hora de la última muestra completada e indicador de consulta en curso.
+- Resumen inicial con alertas de CPU, RAM, disco, batería y fallos de red o Docker.
 - Sistema operativo, CPU, núcleos físicos y lógicos.
 - Memoria RAM, espacio ocupado en el disco raíz (`/`) y tiempo encendido.
 - Estado y porcentaje de las baterías disponibles.
@@ -93,6 +95,31 @@ El panel pide ampliar la terminal si tiene menos de 36 columnas o 12 filas.
 Los porcentajes altos de CPU, RAM y disco aparecen en amarillo desde el 75 % y
 en rojo desde el 90 %. La batería usa amarillo al 20 % o menos y rojo al 10 % o menos.
 
+### Actualización y alertas
+
+La cabecera muestra `Consultando primera muestra…`, `Actualizando…` o la hora de
+la última actualización. La fecha y hora completas, con zona horaria, también
+aparecen al principio de los datos, tanto en el panel como con `--once`. Indican
+el momento en que terminó la recogida, no una medición simultánea de todos los
+recursos. Mientras se consulta, los datos anteriores permanecen visibles.
+
+El resumen usa los mismos umbrales que los colores: aviso desde el 75 % y estado
+crítico desde el 90 % en CPU, RAM y disco; batería baja al 20 % y crítica al 10 %.
+La alerta de batería incluye su estado, también si está cargando. Se avisa cuando
+CPU, RAM, disco o el porcentaje de una batería no están disponibles, y cuando
+fallan las consultas de red o Docker. No tener batería o conexión Wi-Fi no se
+considera por sí solo una avería; los detalles siguen en sus secciones.
+
+`Sin alertas en las métricas comprobadas` no garantiza acceso a Internet ni que
+todo el equipo esté sano: solo resume las comprobaciones descritas aquí.
+
+Si una actualización completa falla inesperadamente, el panel muestra el error,
+conserva la última muestra válida **sin cambiar su fecha** y reintenta después
+del intervalo configurado. También puedes pulsar `r` para solicitar otro intento.
+Si todavía no existe una muestra válida, indica `ERROR: sin datos`. Los fallos
+parciales esperados, como Docker no instalado, se muestran en una nueva muestra
+con el aviso correspondiente, sin impedir actualizar el resto de los datos.
+
 ## Cómo funciona el código
 
 Todo el programa está en `src/monitor.py`, dividido en funciones: bloques de
@@ -103,7 +130,7 @@ código con nombre que realizan una tarea concreta.
 2. **Recogida:** `collect_data()` ejecuta las consultas en paralelo y devuelve un
    diccionario: una estructura que relaciona nombres con valores.
 3. **Presentación:** `format_snapshot()` convierte ese diccionario en líneas y
-   colores, sin volver a consultar el equipo.
+   colores, sin volver a consultar el equipo; `summary_lines()` prepara las alertas.
 4. **Interfaz:** `run_screen()` dibuja el panel con `curses` y atiende las teclas.
    La recogida se ejecuta en segundo plano para no bloquear el teclado. Solo hay
    una muestra en curso; no se acumulan consultas si pulsas `r` varias veces.
@@ -132,6 +159,8 @@ Utilizan `unittest`, incluido en Python. Comprueban cálculos, lectura de archiv
 de ejemplo, comandos ausentes o fallidos, presentación y atención del teclado
 mientras una consulta sigue pendiente. No necesitan Docker, Wi-Fi ni una terminal
 interactiva: sustituyen esas dependencias por datos controlados.
+También verifican los umbrales de alerta, las marcas de tiempo y la conservación
+y recuperación de datos cuando falla una actualización.
 
 ## Limitaciones y resolución de problemas
 
