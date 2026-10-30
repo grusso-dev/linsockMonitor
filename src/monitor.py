@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Panel de estado del equipo para Linux. Sin dependencias de pip."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import curses
 import datetime
 import json
@@ -215,22 +216,55 @@ def percent_color(percent):
     return 4 if percent >= 90 else 3 if percent >= 75 else 1
 
 
-def snapshot(details=False):
-    batteries = battery_info()
-    networks, error = network_info()
-    ssid, wifi_error = wifi_info()
-    containers, docker_error = docker_info()
-    preferred = default_interface() if networks else None
+def disk_info():
+    try:
+        return shutil.disk_usage('/')
+    except OSError:
+        return None
+
+
+def collect_data():
+    """Recoge los datos en paralelo, sin decidir cómo se mostrarán."""
+    collectors = {
+        'batteries': battery_info,
+        'networks': network_info,
+        'wifi': wifi_info,
+        'containers': docker_info,
+        'preferred': default_interface,
+        'os': os_info,
+        'cpu': cpu_usage,
+        'physical': physical_cores,
+        'memory': memory_info,
+        'disk': disk_info,
+        'uptime': uptime_info,
+    }
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {name: executor.submit(collector)
+                   for name, collector in collectors.items()}
+        data = {name: future.result() for name, future in futures.items()}
+    data['logical'] = len(data['cpu'][1]) or os.cpu_count()
+    data['kernel'] = platform.release()
+    data['architecture'] = platform.machine()
+    return data
+
+
+def format_snapshot(data, details=False):
+    """Convierte los datos recogidos en líneas de texto y colores."""
+    batteries = data['batteries']
+    networks, error = data['networks']
+    ssid, wifi_error = data['wifi']
+    containers, docker_error = data['containers']
+    preferred = data['preferred']
     main_network = next((row for row in networks if row[0] == preferred), None)
     if main_network is None:
         main_network = next((row for row in networks if row[3] == 'UP'
                              and row[0].startswith(('wl', 'en', 'eth', 'ww'))), None)
-    lines = [('SISTEMA', 2), (f'SO           {os_info()}', 0)]
-    cpu, core_usage = cpu_usage()
+    lines = [('SISTEMA', 2), (f"SO           {data['os']}", 0)]
+    cpu, core_usage = data['cpu']
     lines.append((f'CPU          {cpu}%' if cpu is not None else 'CPU          No disponible',
                   percent_color(cpu) if cpu is not None else 0))
-    logical = len(core_usage) or os.cpu_count()
-    physical = physical_cores()
+    logical = data['logical']
+    physical = data['physical']
     if physical and logical:
         core_text = f'{physical} físicos · {logical} lógicos'
     elif logical:
@@ -238,23 +272,23 @@ def snapshot(details=False):
     else:
         core_text = 'No disponible'
     lines.append((f'Núcleos      {core_text}', 0))
-    memory = memory_info()
+    memory = data['memory']
     if memory:
         used, total = memory
         lines.append((f'RAM          {size_gib(used)} / {size_gib(total)}',
                       percent_color(100 * used / total) if total else 0))
     else:
         lines.append(('RAM          No disponible', 0))
-    try:
-        disk = shutil.disk_usage('/')
+    disk = data['disk']
+    if disk is not None:
         lines.append((f'Disco /      {size_gib(disk.used)} / {size_gib(disk.total)}',
                       percent_color(100 * disk.used / disk.total) if disk.total else 0))
-    except OSError:
+    else:
         lines.append(('Disco /      No disponible', 0))
-    lines.append((f'Encendido    {uptime_info()}', 0))
+    lines.append((f"Encendido    {data['uptime']}", 0))
     if details:
-        lines.append((f'Núcleo       {platform.release()}', 0))
-        lines.append((f'Arquitectura {platform.machine()}', 0))
+        lines.append((f"Núcleo       {data['kernel']}", 0))
+        lines.append((f"Arquitectura {data['architecture']}", 0))
         if core_usage:
             lines.extend([('', 0), ('USO POR NÚCLEO LÓGICO', 2)])
             for name, usage in core_usage.items():
@@ -304,7 +338,18 @@ def snapshot(details=False):
     return lines
 
 
+def snapshot(details=False):
+    """Obtiene y prepara una muestra para el modo de texto."""
+    return format_snapshot(collect_data(), details)
+
+
 def screen(stdscr, interval):
+    # El hilo principal queda libre para dibujar y atender el teclado.
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        run_screen(stdscr, interval, executor)
+
+
+def run_screen(stdscr, interval, executor):
     try:
         curses.curs_set(0)
     except curses.error:
@@ -318,13 +363,19 @@ def screen(stdscr, interval):
                               (3, curses.COLOR_YELLOW), (4, curses.COLOR_RED)]:
             curses.init_pair(number, color, -1)
     next_refresh = 0
-    lines = []
+    lines = [('Recogiendo información…', 0)]
+    data = None
+    pending = None
     details = False
     scroll = 0
     while True:
-        if time.monotonic() >= next_refresh:
-            lines = snapshot(details)
+        if pending is not None and pending.done():
+            data = pending.result()
+            pending = None
+            lines = format_snapshot(data, details)
             next_refresh = time.monotonic() + interval
+        if pending is None and time.monotonic() >= next_refresh:
+            pending = executor.submit(collect_data)
         stdscr.erase()
         height, width = stdscr.getmaxyx()
         if height >= 4 and width >= 8:
@@ -359,7 +410,8 @@ def screen(stdscr, interval):
         if key in (ord('d'), ord('D')):
             details = not details
             scroll = 0
-            next_refresh = 0
+            if data is not None:
+                lines = format_snapshot(data, details)
         if key in (curses.KEY_DOWN, ord('j')):
             scroll = min(scroll + 1, max(0, len(lines) - visible))
         if key in (curses.KEY_UP, ord('k')):
@@ -371,8 +423,9 @@ def screen(stdscr, interval):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--once', action='store_true', help='Mostrar una vez, sin interfaz')
-    parser.add_argument('--details', action='store_true', help='Incluir contenedores e interfaces con --once')
-    parser.add_argument('--interval', type=float, default=2, help='Refresco en segundos (mínimo 0.5)')
+    parser.add_argument('--details', action='store_true', help='Incluir detalles adicionales con --once')
+    parser.add_argument('--interval', type=float, default=2,
+                        help='Espera entre muestras en segundos (0.5 a 3600; predeterminado: 2)')
     args = parser.parse_args()
     if not 0.5 <= args.interval <= 3600:
         parser.error('--interval debe estar entre 0.5 y 3600')
